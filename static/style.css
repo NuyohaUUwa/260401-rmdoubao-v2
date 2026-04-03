@@ -1,0 +1,240 @@
+:root {
+  --bg: #f3f5ef;
+  --panel: #fffdf7;
+  --line: #d8d2c3;
+  --text: #1c241b;
+  --muted: #667065;
+  --accent: #1e6f4f;
+  --accent-strong: #15533b;
+  --warn: #a95f1e;
+  --error: #a02525;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei UI", sans-serif;
+  background:
+    radial-gradient(circle at top right, #d8ead4 0, transparent 28%),
+    linear-gradient(180deg, #eef4e8 0, var(--bg) 100%);
+  color: var(--text);
+}
+
+.page {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 32px 18px 48px;
+}
+
+.hero {
+  margin-bottom: 20px;
+}
+
+.hero h1,
+.panel h2 {
+  margin: 0 0 8px;
+}
+
+.hero p,
+.submit-message,
+.meta-line,
+.field small {
+  color: var(--muted);
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 18px;
+  margin-bottom: 18px;
+  box-shadow: 0 10px 30px rgba(20, 30, 20, 0.04);
+}
+
+.form,
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.field input[type="text"],
+.field input[type="file"],
+.field select {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+
+.field.checkbox {
+  justify-content: center;
+}
+
+.field.checkbox input {
+  width: 18px;
+  height: 18px;
+}
+
+.advanced {
+  margin-top: 14px;
+}
+
+.advanced summary {
+  cursor: pointer;
+  margin-bottom: 12px;
+  color: var(--accent-strong);
+}
+
+.actions {
+  margin-top: 18px;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  padding: 12px 20px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.queue-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.queue-summary div,
+.job-card {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+}
+
+.queue-summary div {
+  padding: 14px;
+}
+
+.queue-summary strong {
+  display: block;
+  font-size: 28px;
+  margin-bottom: 6px;
+}
+
+.jobs {
+  display: grid;
+  gap: 14px;
+}
+
+.jobs.empty {
+  color: var(--muted);
+}
+
+.job-card {
+  padding: 16px;
+}
+
+.job-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.job-title {
+  font-size: 18px;
+  margin: 0 0 6px;
+  word-break: break-all;
+}
+
+.badge {
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  background: #e3efe7;
+  color: var(--accent-strong);
+}
+
+.badge.failed {
+  background: #f7dfdf;
+  color: var(--error);
+}
+
+.badge.queued {
+  background: #f2e8d5;
+  color: var(--warn);
+}
+
+.meta-line {
+  margin: 12px 0 0;
+}
+
+.progress-track {
+  margin-top: 14px;
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: #e8e5dc;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #32986e, #1e6f4f);
+  transition: width 0.3s ease;
+}
+
+.job-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.download-link {
+  color: var(--accent-strong);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.error-text {
+  color: var(--error);
+}
+
+@media (max-width: 720px) {
+  .grid,
+  .queue-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .job-head {
+    flex-direction: column;
+  }
+
+  .actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
