@@ -30,6 +30,8 @@ class Detection:
     boxes: list[tuple[int, int, int, int]]
     merged: tuple[int, int, int, int]
     corner: str
+    instances: list[tuple[int, int, int, int]]
+    mode: str = "rect"
 
 
 def repo_root() -> Path:
@@ -292,11 +294,178 @@ def _make_detection(
     boxes: list[tuple[int, int, int, int]],
     w: int,
     h: int,
+    *,
+    instances: list[tuple[int, int, int, int]] | None = None,
+    mode: str = "rect",
 ) -> Detection | None:
     merged = _merge_boxes(boxes)
     if merged is None:
         return None
-    return Detection(boxes=boxes, merged=merged, corner=classify_corner(merged, w, h))
+    if instances is None:
+        instances = boxes[:]
+    return Detection(boxes=boxes, merged=merged, corner=classify_corner(merged, w, h), instances=instances, mode=mode)
+
+
+def _split_box_by_text_count(
+    box: tuple[int, int, int, int],
+    text: str,
+) -> list[tuple[int, int, int, int]]:
+    x0, y0, x1, y1 = box
+    w = max(1, x1 - x0)
+    h = max(1, y1 - y0)
+    compact = text.replace(" ", "").strip()
+    n = max(1, min(len(compact), 20))
+    # 近似切分字符框：横排按宽度切分，竖排按高度切分。
+    horizontal = w >= h
+    chunks: list[tuple[int, int, int, int]] = []
+    if horizontal:
+        step = w / n
+        for i in range(n):
+            cx0 = int(round(x0 + i * step))
+            cx1 = int(round(x0 + (i + 1) * step))
+            if cx1 <= cx0:
+                continue
+            chunks.append((cx0, y0, cx1, y1))
+    else:
+        step = h / n
+        for i in range(n):
+            cy0 = int(round(y0 + i * step))
+            cy1 = int(round(y0 + (i + 1) * step))
+            if cy1 <= cy0:
+                continue
+            chunks.append((x0, cy0, x1, cy1))
+    return chunks or [box]
+
+
+def _segment_text_instances(
+    frame: np.ndarray,
+    box: tuple[int, int, int, int],
+    *,
+    min_instance_area: int,
+) -> list[tuple[int, int, int, int]]:
+    h, w = frame.shape[:2]
+    x0, y0, x1, y1 = box
+    x0, y0, x1, y1 = expand_bbox(x0, y0, x1, y1, 1, w, h)
+    roi = frame[y0:y1, x0:x1]
+    if roi.size == 0:
+        return [box]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    bw = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        15,
+        3,
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return [box]
+    instances: list[tuple[int, int, int, int]] = []
+    for cnt in contours:
+        rx, ry, rw, rh = cv2.boundingRect(cnt)
+        area = rw * rh
+        if area < min_instance_area or rw < 2 or rh < 4:
+            continue
+        ex0 = max(0, x0 + rx - 1)
+        ey0 = max(0, y0 + ry - 1)
+        ex1 = min(w, x0 + rx + rw + 1)
+        ey1 = min(h, y0 + ry + rh + 1)
+        if ex1 > ex0 and ey1 > ey0:
+            instances.append((ex0, ey0, ex1, ey1))
+    if not instances:
+        return [box]
+    instances.sort(key=lambda b: (b[0], b[1]))
+    return instances[:24]
+
+
+def _dedupe_boxes(boxes: list[tuple[int, int, int, int]], *, threshold: float = 0.75) -> list[tuple[int, int, int, int]]:
+    kept: list[tuple[int, int, int, int]] = []
+    for box in sorted(boxes, key=lambda b: ((b[2] - b[0]) * (b[3] - b[1]))):
+        if any(iou(box, old) >= threshold for old in kept):
+            continue
+        kept.append(box)
+    return kept
+
+
+def _ocr_instances_from_results(
+    frame: np.ndarray,
+    results: list[Any],
+    patterns: list[re.Pattern[str]],
+    pad: int,
+    fw: int,
+    fh: int,
+    *,
+    ox: int = 0,
+    oy: int = 0,
+    min_instance_area: int = 12,
+) -> list[tuple[int, int, int, int]]:
+    instances: list[tuple[int, int, int, int]] = []
+    for item in results:
+        if len(item) < 2:
+            continue
+        box, text = item[0], str(item[1])
+        if not text_matches(text, patterns) and not fuzzy_watermark_match(text):
+            continue
+        arr = np.array(box, dtype=np.float32)
+        bx0, by0, bx1, by1 = bbox_from_easyocr_box(arr)
+        bx0, by0, bx1, by1 = bx0 + ox, by0 + oy, bx1 + ox, by1 + oy
+        coarse = _split_box_by_text_count((bx0, by0, bx1, by1), text)
+        for cbox in coarse:
+            sx0, sy0, sx1, sy1 = expand_bbox(*cbox, pad // 3, fw, fh)
+            segmented = _segment_text_instances(
+                frame,
+                (sx0, sy0, sx1, sy1),
+                min_instance_area=max(4, min_instance_area),
+            )
+            for inst in segmented:
+                instances.append(expand_bbox(*inst, 1, fw, fh))
+    return _dedupe_boxes(instances)
+
+
+def readtext_keyword_instances(
+    reader: Any,
+    frame: np.ndarray,
+    image: np.ndarray,
+    patterns: list[re.Pattern[str]],
+    pad: int,
+    fw: int,
+    fh: int,
+    ox: int = 0,
+    oy: int = 0,
+    *,
+    min_instance_area: int = 12,
+    mag_ratio: float = 1.0,
+    text_threshold: float = 0.45,
+    low_text: float = 0.35,
+    link_threshold: float = 0.35,
+) -> list[tuple[int, int, int, int]]:
+    try:
+        results = reader.readtext(
+            image,
+            detail=1,
+            paragraph=False,
+            mag_ratio=mag_ratio,
+            text_threshold=text_threshold,
+            low_text=low_text,
+            link_threshold=link_threshold,
+        )
+    except Exception:
+        return []
+    return _ocr_instances_from_results(
+        frame=frame,
+        results=results,
+        patterns=patterns,
+        pad=pad,
+        fw=fw,
+        fh=fh,
+        ox=ox,
+        oy=oy,
+        min_instance_area=min_instance_area,
+    )
 
 
 def detect_watermark_boxes(
@@ -304,11 +473,55 @@ def detect_watermark_boxes(
     frame: np.ndarray,
     patterns: list[re.Pattern[str]],
     pad: int,
+    *,
+    min_instance_area: int = 12,
 ) -> Detection | None:
     h, w = frame.shape[:2]
+    char_direct = readtext_keyword_instances(
+        reader,
+        frame,
+        frame,
+        patterns,
+        pad,
+        w,
+        h,
+        min_instance_area=min_instance_area,
+    )
+    if char_direct:
+        return _make_detection(char_direct, w, h, instances=char_direct, mode="char")
+
+    char_found: list[tuple[int, int, int, int]] = []
+    for x0, y0, x1, y1 in corner_rois(w, h):
+        roi = frame[y0:y1, x0:x1]
+        if roi.size == 0:
+            continue
+        for variant in preprocess_ocr_variants(roi):
+            instances = readtext_keyword_instances(
+                reader,
+                frame,
+                variant,
+                patterns,
+                pad,
+                w,
+                h,
+                x0,
+                y0,
+                min_instance_area=min_instance_area,
+                mag_ratio=1.25,
+                text_threshold=0.30,
+                low_text=0.20,
+                link_threshold=0.20,
+            )
+            if instances:
+                char_found.extend(instances)
+                break
+    if char_found:
+        char_found = _dedupe_boxes(char_found)
+        return _make_detection(char_found, w, h, instances=char_found, mode="char")
+
     direct = readtext_keyword_boxes(reader, frame, patterns, pad, w, h)
     if direct is not None:
-        return Detection(boxes=[direct], merged=direct, corner=classify_corner(direct, w, h))
+        return Detection(boxes=[direct], merged=direct, corner=classify_corner(direct, w, h), instances=[direct], mode="rect")
 
     found: list[tuple[int, int, int, int]] = []
     for x0, y0, x1, y1 in corner_rois(w, h):
@@ -333,7 +546,7 @@ def detect_watermark_boxes(
             if box is not None:
                 found.append(box)
                 break
-    det = _make_detection(found, w, h)
+    det = _make_detection(found, w, h, instances=found, mode="rect")
     if det is not None:
         return det
 
@@ -358,7 +571,7 @@ def detect_watermark_boxes(
         )
         if box is not None:
             found.append(box)
-    return _make_detection(found, w, h)
+    return _make_detection(found, w, h, instances=found, mode="rect")
 
 
 def refine_detections(
@@ -456,7 +669,13 @@ def smooth_box_sequence(
             continue
         arr = np.array(neighbors, dtype=np.int32)
         merged = tuple(int(v) for v in np.median(arr, axis=0).tolist())
-        smoothed[i] = Detection(boxes=[merged], merged=merged, corner=det.corner)
+        smoothed[i] = Detection(
+            boxes=det.boxes[:],
+            merged=merged,
+            corner=det.corner,
+            instances=det.instances[:],
+            mode=det.mode,
+        )
     return smoothed
 
 
@@ -486,16 +705,58 @@ def enforce_local_consistency(
         )
 
         if curr_det is None:
-            fixed[i] = Detection(boxes=[stable_box], merged=stable_box, corner=prev_det.corner)
+            fixed[i] = Detection(
+                boxes=[stable_box],
+                merged=stable_box,
+                corner=prev_det.corner,
+                instances=prev_det.instances[:] if prev_det.instances else [stable_box],
+                mode=prev_det.mode,
+            )
             continue
 
         if curr_det.corner != prev_det.corner:
-            fixed[i] = Detection(boxes=[stable_box], merged=stable_box, corner=prev_det.corner)
+            fixed[i] = Detection(
+                boxes=[stable_box],
+                merged=stable_box,
+                corner=prev_det.corner,
+                instances=prev_det.instances[:] if prev_det.instances else [stable_box],
+                mode=prev_det.mode,
+            )
             continue
 
         if iou(curr_det.merged, prev_det.merged) < 0.35 and iou(curr_det.merged, next_det.merged) < 0.35:
-            fixed[i] = Detection(boxes=[stable_box], merged=stable_box, corner=prev_det.corner)
+            fixed[i] = Detection(
+                boxes=[stable_box],
+                merged=stable_box,
+                corner=prev_det.corner,
+                instances=prev_det.instances[:] if prev_det.instances else [stable_box],
+                mode=prev_det.mode,
+            )
     return fixed
+
+
+def instances_to_mask(
+    frame: np.ndarray,
+    det: Detection,
+    *,
+    mask_mode: str = "char",
+    char_dilate: int = 1,
+    char_blur: int = 3,
+) -> np.ndarray:
+    if mask_mode != "char" or det.mode != "char" or not det.instances:
+        return box_to_mask(frame, det.boxes)
+    h, w = frame.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for x0, y0, x1, y1 in det.instances:
+        x0, y0, x1, y1 = expand_bbox(x0, y0, x1, y1, max(0, char_dilate), w, h)
+        cv2.rectangle(mask, (x0, y0), (x1, y1), 255, thickness=-1)
+    k = max(1, int(char_blur))
+    if k % 2 == 0:
+        k += 1
+    if k > 1:
+        mask = cv2.GaussianBlur(mask, (k, k), 0)
+    _, mask = cv2.threshold(mask, 8, 255, cv2.THRESH_BINARY)
+    return mask
 
 
 def box_to_mask(
@@ -546,6 +807,10 @@ def temporal_blend_repair(
     prev_frame: np.ndarray | None,
     det: Detection | None,
     prev_det: Detection | None,
+    *,
+    mask_mode: str = "char",
+    char_dilate: int = 1,
+    char_blur: int = 3,
 ) -> np.ndarray:
     if (
         prev_repaired is None
@@ -561,7 +826,13 @@ def temporal_blend_repair(
     if motion > 8.0:
         return repaired
 
-    mask = box_to_mask(current_frame, det.boxes)
+    mask = instances_to_mask(
+        current_frame,
+        det,
+        mask_mode=mask_mode,
+        char_dilate=char_dilate,
+        char_blur=max(5, char_blur),
+    )
     blur = cv2.GaussianBlur(mask, (15, 15), 0).astype(np.float32) / 255.0
     if float(blur.max()) <= 0.01:
         return repaired
@@ -613,9 +884,15 @@ def mode_auto(
     ocr_interval: int,
     carry_bbox: bool,
     progress: ProgressCallback | None = None,
+    scan_progress: ProgressCallback | None = None,
     use_gpu: bool | None = None,
     roi_fallback: bool = True,
     stage_callback: StageCallback | None = None,
+    mask_mode: str = "char",
+    char_dilate: int = 1,
+    char_blur: int = 3,
+    track_gap: int = 8,
+    min_instance_area: int = 12,
 ) -> None:
     del ocr_interval
     del carry_bbox
@@ -648,14 +925,19 @@ def mode_auto(
         ok, frame = cap.read()
         if not ok:
             break
-        det = detect_watermark_boxes(reader, frame, patterns, pad)
+        det = detect_watermark_boxes(reader, frame, patterns, pad, min_instance_area=min_instance_area)
         detections.append(det)
+        if scan_progress is not None:
+            idx = len(detections)
+            tot = total_est if total_est > 0 else idx
+            if idx == 1 or idx % 5 == 0 or (total_est > 0 and idx == total_est):
+                scan_progress(idx, tot)
     cap.release()
 
     if not detections:
         raise SystemExit("未读取到任何帧")
 
-    resolved = refine_detections(detections, len(detections))
+    resolved = refine_detections(detections, len(detections), gap_window=max(2, track_gap))
     resolved = smooth_box_sequence(resolved, len(resolved))
     resolved = enforce_local_consistency(resolved, len(resolved))
 
@@ -675,6 +957,8 @@ def mode_auto(
         prev_input_frame: np.ndarray | None = None
         prev_output_frame: np.ndarray | None = None
         prev_det: Detection | None = None
+        fallback_rect_count = 0
+        repaired_count = 0
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -682,7 +966,13 @@ def mode_auto(
             det = resolved[frame_idx] if frame_idx < len(resolved) else None
             curr_input = frame.copy()
             if det is not None:
-                mask = box_to_mask(frame, det.boxes)
+                mask = instances_to_mask(
+                    frame,
+                    det,
+                    mask_mode=mask_mode,
+                    char_dilate=max(0, char_dilate),
+                    char_blur=max(1, char_blur),
+                )
                 radius = choose_inpaint_radius(det.boxes, inpaint_radius)
                 frame = cv2.inpaint(frame, mask, radius, cv2.INPAINT_TELEA)
                 frame = temporal_blend_repair(
@@ -692,7 +982,13 @@ def mode_auto(
                     prev_input_frame,
                     det,
                     prev_det,
+                    mask_mode=mask_mode,
+                    char_dilate=char_dilate,
+                    char_blur=char_blur,
                 )
+                repaired_count += 1
+                if mask_mode == "char" and det.mode != "char":
+                    fallback_rect_count += 1
             out_png = tmpdir / f"frame_{frame_idx:06d}.png"
             if not cv2.imwrite(str(out_png), frame):
                 raise RuntimeError(f"写入中间帧失败: {out_png}")
@@ -703,6 +999,11 @@ def mode_auto(
             if progress is not None:
                 tot = total_est if total_est > 0 else max(frame_idx, 1)
                 progress(frame_idx, tot)
+        if mask_mode == "char" and repaired_count > 0 and fallback_rect_count > 0:
+            print(
+                f"[watermark] 字符级回退到矩形模式: {fallback_rect_count}/{repaired_count} 帧",
+                file=sys.stderr,
+            )
 
         cap.release()
         if frame_idx == 0:

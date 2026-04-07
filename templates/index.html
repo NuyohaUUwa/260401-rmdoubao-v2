@@ -4,9 +4,17 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{ title }}</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ sv }}">
 </head>
 <body>
+  <header class="topbar">
+    <span class="topbar-brand">视频水印消除工具</span>
+    <div class="topbar-user">
+      <span id="user-info"></span>
+      <button id="logout-btn" type="button">退出登录</button>
+    </div>
+  </header>
+
   <main class="page">
     <section class="hero">
       <h1>视频水印消除工具</h1>
@@ -67,8 +75,13 @@
       <h2>任务列表</h2>
       <div id="jobs" class="jobs empty">暂无任务</div>
     </section>
+
+    <section class="panel">
+      <h2>历史列表</h2>
+      <div id="history-jobs" class="jobs empty">暂无历史任务</div>
+    </section>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v={{ sv }}"></script>
 </body>
 </html>

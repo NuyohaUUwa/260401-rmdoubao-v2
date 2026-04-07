@@ -18,6 +18,7 @@ PRESETS: dict[str, dict[str, int]] = {
     "标准（推荐）": {"pad": 18, "radius": 5, "crf": 18},
     "更干净": {"pad": 20, "radius": 5, "crf": 17},
     "更清晰": {"pad": 18, "radius": 4, "crf": 16},
+    "更快速": {"pad": 18, "radius": 5, "crf": 21},
 }
 
 MAX_BATCH_UPLOADS = 3
@@ -59,6 +60,12 @@ class JobRecord:
     keywords: list[str]
     use_gpu: bool
     ffmpeg_path: str | None
+    owner: str = "user"
+    mask_mode: str = "char"
+    char_dilate: int = 1
+    char_blur: int = 3
+    track_gap: int = 8
+    min_instance_area: int = 12
     status: str = "queued"
     stage: str = "uploaded"
     stage_label: str = STAGE_LABELS["uploaded"]
@@ -92,7 +99,20 @@ class JobManager:
             "max_batch_uploads": MAX_BATCH_UPLOADS,
             "max_queue_size": MAX_QUEUE_SIZE,
             "stage_labels": STAGE_LABELS,
+            "mask_modes": ["char", "rect"],
+            "default_mask_mode": "char",
         }
+
+    @staticmethod
+    def _can_access(job: JobRecord, username: str, role: str) -> bool:
+        return role == "admin" or job.owner == username
+
+    def _visible_job_ids(self, username: str, role: str) -> list[str]:
+        return [
+            job_id
+            for job_id, job in self._jobs.items()
+            if self._can_access(job, username, role)
+        ]
 
     def create_jobs(
         self,
@@ -101,6 +121,12 @@ class JobManager:
         use_gpu: bool,
         keywords_raw: str,
         ffmpeg_path: str | None,
+        owner: str,
+        mask_mode: str = "char",
+        char_dilate: int = 1,
+        char_blur: int = 3,
+        track_gap: int = 8,
+        min_instance_area: int = 12,
     ) -> list[dict[str, Any]]:
         if not files:
             raise ValueError("请至少上传 1 个视频文件。")
@@ -108,10 +134,23 @@ class JobManager:
             raise ValueError(f"单次最多上传 {MAX_BATCH_UPLOADS} 个视频。")
         if preset not in PRESETS:
             raise ValueError("无效的预设。")
+        if mask_mode not in {"char", "rect"}:
+            raise ValueError("无效的掩膜模式，仅支持 char 或 rect。")
+        if preset == "更快速":
+            # “更快速”固定走修改前的矩形方案。
+            mask_mode = "rect"
+            char_dilate = 0
+            char_blur = 1
+            track_gap = 4
+            min_instance_area = 16
 
         keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
         if not keywords:
             keywords = [k.strip() for k in DEFAULT_KEYWORDS.split(",") if k.strip()]
+        char_dilate = max(0, min(8, int(char_dilate)))
+        char_blur = max(1, min(15, int(char_blur)))
+        track_gap = max(2, min(24, int(track_gap)))
+        min_instance_area = max(4, min(128, int(min_instance_area)))
 
         with self._lock:
             inflight = sum(1 for job in self._jobs.values() if job.status in {"queued", "running"})
@@ -144,6 +183,12 @@ class JobManager:
                     keywords=keywords,
                     use_gpu=use_gpu,
                     ffmpeg_path=ffmpeg_path.strip() if ffmpeg_path and ffmpeg_path.strip() else None,
+                    owner=owner,
+                    mask_mode=mask_mode,
+                    char_dilate=char_dilate,
+                    char_blur=char_blur,
+                    track_gap=track_gap,
+                    min_instance_area=min_instance_area,
                 )
                 self._jobs[job_id] = job
                 self._job_subscribers[job_id] = []
@@ -156,28 +201,44 @@ class JobManager:
             self._broadcast_queue()
             return [self._serialize_job(job.job_id) for job in created]
 
-    def get_job(self, job_id: str) -> dict[str, Any] | None:
+    def get_job(self, job_id: str, username: str, role: str) -> dict[str, Any] | None:
         with self._lock:
-            if job_id not in self._jobs:
+            job = self._jobs.get(job_id)
+            if job is None or not self._can_access(job, username, role):
                 return None
             return self._serialize_job(job_id)
 
-    def list_jobs(self) -> dict[str, Any]:
+    def list_jobs(self, username: str, role: str) -> dict[str, Any]:
         with self._lock:
-            jobs = [self._serialize_job(job_id) for job_id in self._jobs]
+            jobs = [
+                self._serialize_job(job_id)
+                for job_id in self._visible_job_ids(username, role)
+                if self._jobs[job_id].status in {"queued", "running"}
+            ]
             jobs.sort(key=lambda item: item["sequence_code"])
             return {
                 "jobs": jobs,
                 "queue": self._queue_summary_locked(),
             }
 
+    def list_history(self, username: str, role: str) -> dict[str, Any]:
+        with self._lock:
+            jobs = [
+                self._serialize_job(job_id)
+                for job_id in self._visible_job_ids(username, role)
+                if self._jobs[job_id].status in {"succeeded", "failed"}
+            ]
+            jobs.sort(key=lambda item: item["sequence_code"], reverse=True)
+            return {"jobs": jobs}
+
     def queue_summary(self) -> dict[str, int]:
         with self._lock:
             return self._queue_summary_locked()
 
-    def subscribe_job(self, job_id: str) -> queue.Queue[dict[str, Any]] | None:
+    def subscribe_job(self, job_id: str, username: str, role: str) -> queue.Queue[dict[str, Any]] | None:
         with self._lock:
-            if job_id not in self._jobs:
+            job = self._jobs.get(job_id)
+            if job is None or not self._can_access(job, username, role):
                 return None
             q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=50)
             self._job_subscribers[job_id].append(q)
@@ -202,10 +263,10 @@ class JobManager:
             if q in self._queue_subscribers:
                 self._queue_subscribers.remove(q)
 
-    def download_info(self, job_id: str) -> tuple[Path, str] | None:
+    def download_info(self, job_id: str, username: str, role: str) -> tuple[Path, str] | None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is None or job.status != "succeeded":
+            if job is None or job.status != "succeeded" or not self._can_access(job, username, role):
                 return None
             path = Path(job.output_path)
             if not path.is_file():
@@ -235,8 +296,19 @@ class JobManager:
             def on_stage(stage: str, message: str) -> None:
                 self._set_job_stage(job_id, stage, message, status="running", event="job.stage_changed")
 
+            def on_scan_progress(current: int, total: int) -> None:
+                percent = min(100.0, round((current / max(total, 1)) * 40.0, 2))
+                with self._lock:
+                    current_job = self._jobs[job_id]
+                    current_job.progress.current = current
+                    current_job.progress.total = total
+                    current_job.progress.percent = percent
+                    current_job.message = f"扫描中 {current}/{total}"
+                    payload = self._serialize_job(job_id)
+                self._emit_job(job_id, "job.progress", payload)
+
             def on_progress(current: int, total: int) -> None:
-                percent = min(100.0, round((current / max(total, 1)) * 100.0, 2))
+                percent = min(100.0, round(40.0 + (current / max(total, 1)) * 60.0, 2))
                 with self._lock:
                     current_job = self._jobs[job_id]
                     current_job.progress.current = current
@@ -260,6 +332,12 @@ class JobManager:
                 use_gpu=job.use_gpu,
                 roi_fallback=True,
                 stage_callback=on_stage,
+                scan_progress=on_scan_progress,
+                mask_mode=job.mask_mode,
+                char_dilate=job.char_dilate,
+                char_blur=job.char_blur,
+                track_gap=job.track_gap,
+                min_instance_area=job.min_instance_area,
             )
             self._set_job_stage(job_id, "completed", "完成", status="succeeded", event="job.succeeded")
         except Exception as exc:

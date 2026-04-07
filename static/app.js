@@ -1,8 +1,10 @@
 const state = {
   jobs: new Map(),
+  historyJobs: new Map(),
   jobStreams: new Map(),
   queueStream: null,
   meta: null,
+  user: null,
 };
 
 function qs(id) {
@@ -68,8 +70,54 @@ function renderJobs() {
 }
 
 function upsertJob(job) {
-  state.jobs.set(job.job_id, job);
+  if (job.status === "succeeded" || job.status === "failed") {
+    state.jobs.delete(job.job_id);
+    state.historyJobs.set(job.job_id, job);
+    renderHistoryJobs();
+  } else {
+    state.jobs.set(job.job_id, job);
+  }
   renderJobs();
+}
+
+function renderHistoryJobs() {
+  const container = qs("history-jobs");
+  const jobs = Array.from(state.historyJobs.values()).sort((a, b) => b.sequence_code.localeCompare(a.sequence_code));
+  if (!jobs.length) {
+    container.className = "jobs empty";
+    container.textContent = "暂无历史任务";
+    return;
+  }
+  container.className = "jobs";
+  container.innerHTML = jobs.map((job) => {
+    const progressText = `${job.progress.current || 0}/${job.progress.total || 0} (${job.progress.percent || 0}%)`;
+    const errorText = job.error ? `<p class="meta-line error-text">${job.error}</p>` : "";
+    const download = job.download_url
+      ? `<a class="download-link" href="${job.download_url}">下载结果</a>`
+      : "";
+    return `
+      <article class="job-card">
+        <div class="job-head">
+          <div>
+            <h3 class="job-title">${job.filename}</h3>
+            <p class="meta-line">序列码：${job.sequence_code} | 任务ID：${job.job_id}</p>
+          </div>
+          ${statusBadge(job)}
+        </div>
+        <p class="meta-line">阶段：${job.stage_label}</p>
+        <p class="meta-line">消息：${job.message}</p>
+        <p class="meta-line">进度：${progressText}</p>
+        <div class="job-actions">${download}</div>
+        ${errorText}
+      </article>
+    `;
+  }).join("");
+}
+
+function setAuthUI(loggedIn) {
+  qs("user-info").textContent = loggedIn && state.user
+    ? `${state.user.username}（${state.user.role}）`
+    : "";
 }
 
 function subscribeQueue() {
@@ -140,6 +188,17 @@ async function loadInitialState() {
       subscribeJob(job.job_id);
     }
   }
+  await loadHistory();
+}
+
+async function loadHistory() {
+  const historyResp = await fetch("/api/history");
+  const historyData = await historyResp.json();
+  state.historyJobs.clear();
+  for (const job of historyData.jobs || []) {
+    state.historyJobs.set(job.job_id, job);
+  }
+  renderHistoryJobs();
 }
 
 async function submitJobs(event) {
@@ -161,6 +220,9 @@ async function submitJobs(event) {
   formData.append("use_gpu", qs("use-gpu").checked ? "true" : "false");
   formData.append("keywords", qs("keywords").value);
   formData.append("ffmpeg_path", qs("ffmpeg-path").value);
+  if (qs("preset").value === "更快速") {
+    formData.append("mask_mode", "rect");
+  }
 
   const submitBtn = qs("submit-btn");
   submitBtn.disabled = true;
@@ -190,9 +252,31 @@ async function submitJobs(event) {
 
 document.addEventListener("DOMContentLoaded", async () => {
   qs("job-form").addEventListener("submit", submitJobs);
-  subscribeQueue();
+  qs("logout-btn").addEventListener("click", async () => {
+    await fetch("/api/auth/logout", { method: "POST" });
+    state.jobs.clear();
+    state.historyJobs.clear();
+    renderJobs();
+    renderHistoryJobs();
+    setSubmitMessage("");
+    state.user = null;
+    if (state.queueStream) {
+      state.queueStream.close();
+      state.queueStream = null;
+    }
+    window.location.href = "/login";
+  });
   try {
-    await loadInitialState();
+    const meResp = await fetch("/api/auth/me");
+    if (meResp.ok) {
+      const me = await meResp.json();
+      state.user = me.user;
+      setAuthUI(true);
+      subscribeQueue();
+      await loadInitialState();
+    } else {
+      window.location.href = "/login";
+    }
   } catch (error) {
     setSubmitMessage("初始化失败，请刷新页面重试。", true);
   }
