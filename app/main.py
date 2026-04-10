@@ -153,7 +153,7 @@ async def download_job(job_id: str) -> FileResponse:
 def main() -> None:
     import uvicorn
 
-    uvicorn.run("app.main:app", host="0.0.0.0", port=10800, reload=False)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=5001, reload=False)
 
 
 if __name__ == "__main__":

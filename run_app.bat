@@ -1,4 +1,7 @@
 @echo off
+chcp 65001 >nul
+title RedoubaoTool
+
 REM Start Doubao Watermark Remover FastAPI Service
 
 REM Switch to the directory of the current script (project root)
