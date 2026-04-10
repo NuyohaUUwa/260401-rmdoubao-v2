@@ -7,6 +7,7 @@ import re
 import shutil
 import threading
 import uuid
+from datetime import datetime
 from dataclasses import asdict, dataclass, field
 from itertools import count
 from pathlib import Path
@@ -66,6 +67,8 @@ class JobRecord:
     char_blur: int = 3
     track_gap: int = 8
     min_instance_area: int = 12
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    finished_at: str | None = None
     status: str = "queued"
     stage: str = "uploaded"
     stage_label: str = STAGE_LABELS["uploaded"]
@@ -102,17 +105,6 @@ class JobManager:
             "mask_modes": ["char", "rect"],
             "default_mask_mode": "char",
         }
-
-    @staticmethod
-    def _can_access(job: JobRecord, username: str, role: str) -> bool:
-        return role == "admin" or job.owner == username
-
-    def _visible_job_ids(self, username: str, role: str) -> list[str]:
-        return [
-            job_id
-            for job_id, job in self._jobs.items()
-            if self._can_access(job, username, role)
-        ]
 
     def create_jobs(
         self,
@@ -201,18 +193,18 @@ class JobManager:
             self._broadcast_queue()
             return [self._serialize_job(job.job_id) for job in created]
 
-    def get_job(self, job_id: str, username: str, role: str) -> dict[str, Any] | None:
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is None or not self._can_access(job, username, role):
+            if job is None:
                 return None
             return self._serialize_job(job_id)
 
-    def list_jobs(self, username: str, role: str) -> dict[str, Any]:
+    def list_jobs(self) -> dict[str, Any]:
         with self._lock:
             jobs = [
                 self._serialize_job(job_id)
-                for job_id in self._visible_job_ids(username, role)
+                for job_id in self._jobs
                 if self._jobs[job_id].status in {"queued", "running"}
             ]
             jobs.sort(key=lambda item: item["sequence_code"])
@@ -221,11 +213,11 @@ class JobManager:
                 "queue": self._queue_summary_locked(),
             }
 
-    def list_history(self, username: str, role: str) -> dict[str, Any]:
+    def list_history(self) -> dict[str, Any]:
         with self._lock:
             jobs = [
                 self._serialize_job(job_id)
-                for job_id in self._visible_job_ids(username, role)
+                for job_id in self._jobs
                 if self._jobs[job_id].status in {"succeeded", "failed"}
             ]
             jobs.sort(key=lambda item: item["sequence_code"], reverse=True)
@@ -235,10 +227,10 @@ class JobManager:
         with self._lock:
             return self._queue_summary_locked()
 
-    def subscribe_job(self, job_id: str, username: str, role: str) -> queue.Queue[dict[str, Any]] | None:
+    def subscribe_job(self, job_id: str) -> queue.Queue[dict[str, Any]] | None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is None or not self._can_access(job, username, role):
+            if job is None:
                 return None
             q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=50)
             self._job_subscribers[job_id].append(q)
@@ -263,10 +255,10 @@ class JobManager:
             if q in self._queue_subscribers:
                 self._queue_subscribers.remove(q)
 
-    def download_info(self, job_id: str, username: str, role: str) -> tuple[Path, str] | None:
+    def download_info(self, job_id: str) -> tuple[Path, str] | None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is None or job.status != "succeeded" or not self._can_access(job, username, role):
+            if job is None or job.status != "succeeded":
                 return None
             path = Path(job.output_path)
             if not path.is_file():
@@ -347,6 +339,7 @@ class JobManager:
                 current_job.stage = "failed"
                 current_job.stage_label = STAGE_LABELS["failed"]
                 current_job.message = "处理失败"
+                current_job.finished_at = datetime.now().isoformat(timespec="seconds")
                 current_job.error = str(exc)
                 payload = self._serialize_job(job_id)
             self._emit_job(job_id, "job.failed", payload)
@@ -369,6 +362,7 @@ class JobManager:
             job.stage_label = STAGE_LABELS.get(stage, message)
             job.message = message
             if status == "succeeded":
+                job.finished_at = datetime.now().isoformat(timespec="seconds")
                 job.progress.percent = 100.0
                 if job.progress.total > 0:
                     job.progress.current = job.progress.total

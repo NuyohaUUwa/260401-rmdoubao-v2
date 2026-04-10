@@ -9,16 +9,17 @@
 <body>
   <header class="topbar">
     <span class="topbar-brand">视频水印消除工具</span>
-    <div class="topbar-user">
-      <span id="user-info"></span>
-      <button id="logout-btn" type="button">退出登录</button>
-    </div>
   </header>
 
   <main class="page">
     <section class="hero">
       <h1>视频水印消除工具</h1>
       <p>上传最多 3 个视频，系统按队列顺序逐个处理。</p>
+    </section>
+
+    <section class="panel notice-panel">
+      <h2>下载提醒</h2>
+      <p>前端历史列表仅显示最近 30 分钟内的视频结果，超时后会从网页列表隐藏；后台文件和任务数据不删除，请及时下载保存。</p>
     </section>
 
     <section class="panel">
@@ -78,7 +79,7 @@
 
     <section class="panel">
       <h2>历史列表</h2>
-      <div id="history-jobs" class="jobs empty">暂无历史任务</div>
+      <div id="history-jobs" class="jobs empty">暂无 30 分钟内的历史视频</div>
     </section>
   </main>
 

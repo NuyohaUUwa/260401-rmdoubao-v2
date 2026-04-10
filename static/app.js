@@ -4,8 +4,9 @@ const state = {
   jobStreams: new Map(),
   queueStream: null,
   meta: null,
-  user: null,
 };
+
+const HISTORY_WINDOW_MS = 30 * 60 * 1000;
 
 function qs(id) {
   return document.getElementById(id);
@@ -15,6 +16,28 @@ function setSubmitMessage(message, isError = false) {
   const el = qs("submit-message");
   el.textContent = message;
   el.className = isError ? "submit-message error-text" : "submit-message";
+}
+
+function getHistoryBaseTime(job) {
+  return job.finished_at || "";
+}
+
+function formatTimeLimit(job) {
+  const baseTs = Date.parse(getHistoryBaseTime(job));
+  if (Number.isNaN(baseTs)) {
+    return "任务完成后保留 30 分钟，请及时下载保存。";
+  }
+  const remainMs = baseTs + HISTORY_WINDOW_MS - Date.now();
+  if (remainMs <= 0) {
+    return "已超出处理完成后的 30 分钟展示窗口。";
+  }
+  const remainMinutes = Math.max(1, Math.ceil(remainMs / 60000));
+  return `处理完成后保留 30 分钟，请在 ${remainMinutes} 分钟内及时下载保存。`;
+}
+
+function isVisibleHistoryJob(job) {
+  const baseTs = Date.parse(getHistoryBaseTime(job));
+  return !Number.isNaN(baseTs) && Date.now() - baseTs <= HISTORY_WINDOW_MS;
 }
 
 function updateQueueSummary(summary) {
@@ -82,10 +105,12 @@ function upsertJob(job) {
 
 function renderHistoryJobs() {
   const container = qs("history-jobs");
-  const jobs = Array.from(state.historyJobs.values()).sort((a, b) => b.sequence_code.localeCompare(a.sequence_code));
+  const jobs = Array.from(state.historyJobs.values())
+    .filter(isVisibleHistoryJob)
+    .sort((a, b) => b.sequence_code.localeCompare(a.sequence_code));
   if (!jobs.length) {
     container.className = "jobs empty";
-    container.textContent = "暂无历史任务";
+    container.textContent = "暂无 30 分钟内的历史视频";
     return;
   }
   container.className = "jobs";
@@ -106,18 +131,13 @@ function renderHistoryJobs() {
         </div>
         <p class="meta-line">阶段：${job.stage_label}</p>
         <p class="meta-line">消息：${job.message}</p>
+        <p class="meta-line download-reminder">${formatTimeLimit(job)}</p>
         <p class="meta-line">进度：${progressText}</p>
         <div class="job-actions">${download}</div>
         ${errorText}
       </article>
     `;
   }).join("");
-}
-
-function setAuthUI(loggedIn) {
-  qs("user-info").textContent = loggedIn && state.user
-    ? `${state.user.username}（${state.user.role}）`
-    : "";
 }
 
 function subscribeQueue() {
@@ -252,31 +272,10 @@ async function submitJobs(event) {
 
 document.addEventListener("DOMContentLoaded", async () => {
   qs("job-form").addEventListener("submit", submitJobs);
-  qs("logout-btn").addEventListener("click", async () => {
-    await fetch("/api/auth/logout", { method: "POST" });
-    state.jobs.clear();
-    state.historyJobs.clear();
-    renderJobs();
-    renderHistoryJobs();
-    setSubmitMessage("");
-    state.user = null;
-    if (state.queueStream) {
-      state.queueStream.close();
-      state.queueStream = null;
-    }
-    window.location.href = "/login";
-  });
   try {
-    const meResp = await fetch("/api/auth/me");
-    if (meResp.ok) {
-      const me = await meResp.json();
-      state.user = me.user;
-      setAuthUI(true);
-      subscribeQueue();
-      await loadInitialState();
-    } else {
-      window.location.href = "/login";
-    }
+    subscribeQueue();
+    await loadInitialState();
+    window.setInterval(renderHistoryJobs, 30000);
   } catch (error) {
     setSubmitMessage("初始化失败，请刷新页面重试。", true);
   }
