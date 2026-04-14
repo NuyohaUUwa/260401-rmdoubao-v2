@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import queue
+from pathlib import Path
+
+import cv2
+import numpy as np
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
@@ -8,8 +12,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.job_manager import manager, sse_message
+from core.processor import analyze_screenshot, repo_root, unique_advice_preview_path
 
-STATIC_VERSION = "20260414b"
+STATIC_VERSION = "20260414f"
+ADVICE_ROOT = repo_root() / "output" / "_advice"
+ADVICE_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Doubao Watermark Remover")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -109,6 +116,54 @@ async def create_jobs(
         for file in files:
             await file.close()
     return {"jobs": jobs}
+
+
+@app.post("/api/screenshot-advice")
+async def screenshot_advice(file: UploadFile = File(...)) -> dict:
+    try:
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="请上传截图文件。")
+        content_type = str(file.content_type or "").lower()
+        filename = str(file.filename or "").lower()
+        if not (
+            content_type.startswith("image/")
+            or filename.endswith((".png", ".jpg", ".jpeg", ".webp"))
+        ):
+            raise HTTPException(status_code=400, detail="仅支持 png、jpg、jpeg、webp 图片。")
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise HTTPException(status_code=400, detail="图片无法读取，请更换截图后重试。")
+        keywords = [k.strip() for k in manager.meta()["default_keywords"].split(",") if k.strip()]
+        result = analyze_screenshot(frame, keywords)
+        preview_path = unique_advice_preview_path()
+        if not cv2.imwrite(str(preview_path), result.preview_image):
+            raise HTTPException(status_code=500, detail="生成标注预览图失败。")
+        return {
+            "detected": result.detected,
+            "message": result.message,
+            "recommended": result.recommended,
+            "recognized_texts": result.recognized_texts,
+            "boxes": result.boxes,
+            "preview_url": f"/api/advice-preview/{preview_path.name}",
+        }
+    except HTTPException:
+        raise
+    except SystemExit as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"截图分析失败：{exc}") from exc
+    finally:
+        await file.close()
+
+
+@app.get("/api/advice-preview/{filename}")
+async def advice_preview(filename: str) -> FileResponse:
+    path = (ADVICE_ROOT / Path(filename).name).resolve()
+    if path.parent != ADVICE_ROOT.resolve() or not path.is_file():
+        raise HTTPException(status_code=404, detail="预览图不存在。")
+    return FileResponse(path=path, media_type="image/png", filename=path.name)
 
 
 @app.get("/api/jobs/{job_id}/events")
