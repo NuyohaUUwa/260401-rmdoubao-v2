@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -32,6 +33,16 @@ class Detection:
     corner: str
     instances: list[tuple[int, int, int, int]]
     mode: str = "rect"
+
+
+@dataclass
+class AdviceResult:
+    detected: bool
+    message: str
+    recommended: dict[str, Any]
+    recognized_texts: list[str]
+    boxes: list[dict[str, int]]
+    preview_image: np.ndarray
 
 
 def repo_root() -> Path:
@@ -208,14 +219,34 @@ def resolve_use_gpu(requested: bool | None) -> bool:
     return infer_torch_cuda()
 
 
+def build_easyocr_reader(use_gpu: bool | None = None) -> Any:
+    try:
+        import easyocr
+    except ImportError as e:
+        raise SystemExit("请先安装 easyocr: pip install easyocr") from e
+    return easyocr.Reader(["ch_sim", "en"], gpu=resolve_use_gpu(use_gpu), verbose=False)
+
+
 def normalize_ocr_text(text: str) -> str:
-    t = text.replace(" ", "").strip()
+    t = re.sub(r"[\s\-—_.,，:：;；'\"`~]+", "", text).strip()
     t = t.upper()
     return (
-        t.replace("A1", "AI")
+        t.replace("|", "I")
+        .replace("丨", "I")
+        .replace("!", "I")
+        .replace("L", "I")
+        .replace("1", "I")
+        .replace("0", "O")
+        .replace("A1", "AI")
         .replace("AI1", "AI")
+        .replace("AI", "AI")
+        .replace("豆包A工生成", "豆包AI生成")
+        .replace("豆包A生成", "豆包AI生成")
         .replace("豆A1生成", "豆包AI生成")
         .replace("豆AI生成", "豆包AI生成")
+        .replace("AI生戌", "AI生成")
+        .replace("AI牛成", "AI生成")
+        .replace("AI生成图", "AI生成")
     )
 
 
@@ -223,10 +254,13 @@ def fuzzy_watermark_match(text: str) -> bool:
     t = normalize_ocr_text(text)
     if not t:
         return False
-    target = "豆包AI生成"
-    if "豆" in t and any(ch in t for ch in ("包", "AI", "A", "I", "1", "生", "成", "尿", "0", "4")):
+    if "豆" in t and any(ch in t for ch in ("包", "A", "I", "生", "成", "尿", "O", "4")):
         return True
-    return SequenceMatcher(None, t, target).ratio() >= 0.45
+    if "AI" in t and any(ch in t for ch in ("生", "成", "戌", "戒", "城", "牛")):
+        return True
+    targets = ("豆包AI生成", "AI生成")
+    thresholds = {"豆包AI生成": 0.45, "AI生成": 0.68}
+    return any(SequenceMatcher(None, t, target).ratio() >= thresholds[target] for target in targets)
 
 
 def _ocr_boxes_from_results(
@@ -253,6 +287,25 @@ def _ocr_boxes_from_results(
     return boxes
 
 
+def _matching_texts_from_results(results: list[Any], patterns: list[re.Pattern[str]]) -> list[str]:
+    texts: list[str] = []
+    seen: set[str] = set()
+    for item in results:
+        if len(item) < 2:
+            continue
+        txt = str(item[1]).strip()
+        if not txt:
+            continue
+        if not text_matches(txt, patterns) and not fuzzy_watermark_match(txt):
+            continue
+        normalized = normalize_ocr_text(txt)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        texts.append(txt)
+    return texts
+
+
 def _merge_boxes(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int] | None:
     if not boxes:
         return None
@@ -277,16 +330,41 @@ def classify_corner(box: tuple[int, int, int, int], w: int, h: int) -> str:
 def preprocess_ocr_variants(image: np.ndarray) -> list[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     up = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
+    clahe_up = cv2.resize(clahe, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    return [image, gray, up, clahe_up]
+
+
+def aggressive_ocr_variants(image: np.ndarray) -> list[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    up = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    up3 = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
+    clahe_up = cv2.resize(clahe, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    sharpen = cv2.addWeighted(up, 1.4, cv2.GaussianBlur(up, (0, 0), 1.2), -0.4, 0)
     _, th180 = cv2.threshold(up, 180, 255, cv2.THRESH_BINARY)
     _, th160 = cv2.threshold(up, 160, 255, cv2.THRESH_BINARY)
-    return [image, gray, up, th180, th160]
+    _, clahe_th = cv2.threshold(clahe_up, 170, 255, cv2.THRESH_BINARY)
+    _, inv_th = cv2.threshold(255 - clahe_up, 145, 255, cv2.THRESH_BINARY)
+    adaptive = cv2.adaptiveThreshold(
+        clahe_up,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        21,
+        4,
+    )
+    return [image, gray, up, up3, clahe, clahe_up, sharpen, th180, th160, clahe_th, inv_th, adaptive]
 
 
 def corner_rois(w: int, h: int) -> list[tuple[int, int, int, int]]:
     return [
-        (0, int(h * 0.28), int(w * 0.42), h),
-        (int(w * 0.56), int(h * 0.56), w, h),
-        (int(w * 0.66), 0, w, int(h * 0.34)),
+        (0, int(h * 0.24), int(w * 0.46), h),
+        (0, int(h * 0.44), int(w * 0.62), h),
+        (int(w * 0.48), int(h * 0.48), w, h),
+        (int(w * 0.58), int(h * 0.58), w, h),
+        (int(w * 0.60), 0, w, int(h * 0.38)),
+        (int(w * 0.52), 0, w, int(h * 0.30)),
     ]
 
 
@@ -391,6 +469,107 @@ def _dedupe_boxes(boxes: list[tuple[int, int, int, int]], *, threshold: float = 
     return kept
 
 
+def _vertical_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    top = max(a[1], b[1])
+    bottom = min(a[3], b[3])
+    overlap = max(0, bottom - top)
+    denom = max(1, min(a[3] - a[1], b[3] - b[1]))
+    return overlap / denom
+
+
+def _merge_box_pair(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
+
+
+def _should_merge_instances(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    if iou(a, b) >= 0.08:
+        return True
+    gap_x = max(0, max(a[0], b[0]) - min(a[2], b[2]))
+    gap_y = max(0, max(a[1], b[1]) - min(a[3], b[3]))
+    ah = max(1, a[3] - a[1])
+    bh = max(1, b[3] - b[1])
+    aw = max(1, a[2] - a[0])
+    bw = max(1, b[2] - b[0])
+    same_row = _vertical_overlap(a, b) >= 0.45
+    close_x = gap_x <= max(6, int(round(min(ah, bh) * 0.9)))
+    stacked = gap_y <= max(3, int(round(min(ah, bh) * 0.35))) and abs((a[0] + a[2]) - (b[0] + b[2])) <= max(10, min(aw, bw))
+    return (same_row and close_x) or stacked
+
+
+def merge_fragmented_instances(
+    boxes: list[tuple[int, int, int, int]],
+    *,
+    max_groups: int = 8,
+) -> list[tuple[int, int, int, int]]:
+    merged = _dedupe_boxes(boxes, threshold=0.68)
+    changed = True
+    while changed and len(merged) > 1:
+        changed = False
+        next_boxes: list[tuple[int, int, int, int]] = []
+        used = [False] * len(merged)
+        for i, box in enumerate(merged):
+            if used[i]:
+                continue
+            current = box
+            used[i] = True
+            for j in range(i + 1, len(merged)):
+                if used[j]:
+                    continue
+                if _should_merge_instances(current, merged[j]):
+                    current = _merge_box_pair(current, merged[j])
+                    used[j] = True
+                    changed = True
+            next_boxes.append(current)
+        merged = sorted(_dedupe_boxes(next_boxes, threshold=0.60), key=lambda b: (b[0], b[1]))
+
+    if len(merged) <= max_groups:
+        return merged
+
+    # Keep a compact set of left-to-right groups to avoid extremely fragmented masks.
+    merged = sorted(merged, key=lambda b: ((b[0] + b[2]) / 2.0, b[1]))
+    stride = max(1, int(np.ceil(len(merged) / max_groups)))
+    grouped: list[tuple[int, int, int, int]] = []
+    for i in range(0, len(merged), stride):
+        chunk = merged[i : i + stride]
+        if not chunk:
+            continue
+        current = chunk[0]
+        for box in chunk[1:]:
+            current = _merge_box_pair(current, box)
+        grouped.append(current)
+    return grouped[:max_groups]
+
+
+def likely_corner_watermark_scene(frame: np.ndarray) -> bool:
+    h, w = frame.shape[:2]
+    score = 0
+    for x0, y0, x1, y1 in corner_rois(w, h):
+        roi = frame[y0:y1, x0:x1]
+        if roi.size == 0:
+            continue
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        bright_ratio = float(np.mean(gray >= 180))
+        edge_density = float(np.mean(cv2.Canny(gray, 50, 120) > 0))
+        if bright_ratio >= 0.06 and edge_density >= 0.02:
+            score += 1
+            if score >= 2:
+                return True
+    return False
+
+
+def corner_ocr_passes(*, aggressive: bool = False) -> list[dict[str, float]]:
+    base = [
+        {"mag_ratio": 1.25, "text_threshold": 0.30, "low_text": 0.20, "link_threshold": 0.20},
+    ]
+    if not aggressive:
+        return base
+    return [
+        *base,
+        {"mag_ratio": 1.60, "text_threshold": 0.22, "low_text": 0.12, "link_threshold": 0.12},
+        {"mag_ratio": 2.00, "text_threshold": 0.16, "low_text": 0.08, "link_threshold": 0.08},
+    ]
+
+
 def _ocr_instances_from_results(
     frame: np.ndarray,
     results: list[Any],
@@ -423,7 +602,7 @@ def _ocr_instances_from_results(
             )
             for inst in segmented:
                 instances.append(expand_bbox(*inst, 1, fw, fh))
-    return _dedupe_boxes(instances)
+    return merge_fragmented_instances(instances)
 
 
 def readtext_keyword_instances(
@@ -468,6 +647,77 @@ def readtext_keyword_instances(
     )
 
 
+def readtext_matching_texts(
+    reader: Any,
+    image: np.ndarray,
+    patterns: list[re.Pattern[str]],
+    *,
+    mag_ratio: float = 1.0,
+    text_threshold: float = 0.45,
+    low_text: float = 0.35,
+    link_threshold: float = 0.35,
+) -> list[str]:
+    try:
+        results = reader.readtext(
+            image,
+            detail=1,
+            paragraph=False,
+            mag_ratio=mag_ratio,
+            text_threshold=text_threshold,
+            low_text=low_text,
+            link_threshold=link_threshold,
+        )
+    except Exception:
+        return []
+    return _matching_texts_from_results(results, patterns)
+
+
+def collect_matching_texts(
+    reader: Any,
+    frame: np.ndarray,
+    patterns: list[re.Pattern[str]],
+    *,
+    aggressive: bool = True,
+) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add_items(items: list[str]) -> None:
+        for item in items:
+            normalized = normalize_ocr_text(item)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            found.append(item)
+
+    add_items(readtext_matching_texts(reader, frame, patterns))
+    h, w = frame.shape[:2]
+    for x0, y0, x1, y1 in corner_rois(w, h):
+        roi = frame[y0:y1, x0:x1]
+        if roi.size == 0:
+            continue
+        variants = aggressive_ocr_variants(roi) if aggressive else preprocess_ocr_variants(roi)
+        for variant in variants:
+            matched = False
+            for params in corner_ocr_passes(aggressive=aggressive):
+                items = readtext_matching_texts(
+                    reader,
+                    variant,
+                    patterns,
+                    mag_ratio=params["mag_ratio"],
+                    text_threshold=params["text_threshold"],
+                    low_text=params["low_text"],
+                    link_threshold=params["link_threshold"],
+                )
+                if items:
+                    add_items(items)
+                    matched = True
+                    break
+            if matched:
+                break
+    return found
+
+
 def detect_watermark_boxes(
     reader: Any,
     frame: np.ndarray,
@@ -475,6 +725,7 @@ def detect_watermark_boxes(
     pad: int,
     *,
     min_instance_area: int = 12,
+    aggressive_corner_scan: bool = True,
 ) -> Detection | None:
     h, w = frame.shape[:2]
     char_direct = readtext_keyword_instances(
@@ -490,38 +741,79 @@ def detect_watermark_boxes(
     if char_direct:
         return _make_detection(char_direct, w, h, instances=char_direct, mode="char")
 
+    direct = readtext_keyword_boxes(reader, frame, patterns, pad, w, h)
+    if direct is not None:
+        return Detection(boxes=[direct], merged=direct, corner=classify_corner(direct, w, h), instances=[direct], mode="rect")
+
     char_found: list[tuple[int, int, int, int]] = []
+    likely_corner = aggressive_corner_scan and likely_corner_watermark_scene(frame)
     for x0, y0, x1, y1 in corner_rois(w, h):
         roi = frame[y0:y1, x0:x1]
         if roi.size == 0:
             continue
         for variant in preprocess_ocr_variants(roi):
-            instances = readtext_keyword_instances(
-                reader,
-                frame,
-                variant,
-                patterns,
-                pad,
-                w,
-                h,
-                x0,
-                y0,
-                min_instance_area=min_instance_area,
-                mag_ratio=1.25,
-                text_threshold=0.30,
-                low_text=0.20,
-                link_threshold=0.20,
-            )
-            if instances:
-                char_found.extend(instances)
+            matched = False
+            for params in corner_ocr_passes():
+                instances = readtext_keyword_instances(
+                    reader,
+                    frame,
+                    variant,
+                    patterns,
+                    pad,
+                    w,
+                    h,
+                    x0,
+                    y0,
+                    min_instance_area=min_instance_area,
+                    mag_ratio=params["mag_ratio"],
+                    text_threshold=params["text_threshold"],
+                    low_text=params["low_text"],
+                    link_threshold=params["link_threshold"],
+                )
+                if instances:
+                    char_found.extend(instances)
+                    matched = True
+                    break
+            if matched:
                 break
     if char_found:
-        char_found = _dedupe_boxes(char_found)
+        char_found = merge_fragmented_instances(char_found)
         return _make_detection(char_found, w, h, instances=char_found, mode="char")
 
-    direct = readtext_keyword_boxes(reader, frame, patterns, pad, w, h)
-    if direct is not None:
-        return Detection(boxes=[direct], merged=direct, corner=classify_corner(direct, w, h), instances=[direct], mode="rect")
+    if likely_corner:
+        char_found = []
+        for x0, y0, x1, y1 in corner_rois(w, h):
+            roi = frame[y0:y1, x0:x1]
+            if roi.size == 0:
+                continue
+            for variant in aggressive_ocr_variants(roi):
+                matched = False
+                for params in corner_ocr_passes(aggressive=True):
+                    instances = readtext_keyword_instances(
+                        reader,
+                        frame,
+                        variant,
+                        patterns,
+                        pad,
+                        w,
+                        h,
+                        x0,
+                        y0,
+                        min_instance_area=min_instance_area,
+                        mag_ratio=params["mag_ratio"],
+                        text_threshold=params["text_threshold"],
+                        low_text=params["low_text"],
+                        link_threshold=params["link_threshold"],
+                    )
+                    if instances:
+                        char_found.extend(instances)
+                        matched = True
+                        break
+                if matched:
+                    break
+        if char_found:
+            char_found = merge_fragmented_instances(char_found)
+            return _make_detection(char_found, w, h, instances=char_found, mode="char")
 
     found: list[tuple[int, int, int, int]] = []
     for x0, y0, x1, y1 in corner_rois(w, h):
@@ -529,49 +821,209 @@ def detect_watermark_boxes(
         if roi.size == 0:
             continue
         for variant in preprocess_ocr_variants(roi):
-            box = readtext_keyword_boxes(
-                reader,
-                variant,
-                patterns,
-                pad,
-                w,
-                h,
-                x0,
-                y0,
-                mag_ratio=1.25,
-                text_threshold=0.30,
-                low_text=0.20,
-                link_threshold=0.20,
-            )
-            if box is not None:
-                found.append(box)
+            matched = False
+            for params in corner_ocr_passes():
+                box = readtext_keyword_boxes(
+                    reader,
+                    variant,
+                    patterns,
+                    pad,
+                    w,
+                    h,
+                    x0,
+                    y0,
+                    mag_ratio=params["mag_ratio"],
+                    text_threshold=params["text_threshold"],
+                    low_text=params["low_text"],
+                    link_threshold=params["link_threshold"],
+                )
+                if box is not None:
+                    found.append(box)
+                    matched = True
+                    break
+            if matched:
                 break
     det = _make_detection(found, w, h, instances=found, mode="rect")
     if det is not None:
         return det
+
+    if not likely_corner:
+        return None
 
     found = []
     for x0, y0, x1, y1 in corner_rois(w, h):
         roi = frame[y0:y1, x0:x1]
         if roi.size == 0:
             continue
-        box = readtext_keyword_boxes(
-            reader,
-            roi,
-            patterns,
-            pad,
-            w,
-            h,
-            x0,
-            y0,
-            mag_ratio=1.35,
-            text_threshold=0.38,
-            low_text=0.30,
-            link_threshold=0.32,
-        )
-        if box is not None:
-            found.append(box)
+        for variant in aggressive_ocr_variants(roi):
+            matched = False
+            for params in corner_ocr_passes(aggressive=True):
+                box = readtext_keyword_boxes(
+                    reader,
+                    variant,
+                    patterns,
+                    pad,
+                    w,
+                    h,
+                    x0,
+                    y0,
+                    mag_ratio=max(1.35, params["mag_ratio"]),
+                    text_threshold=min(0.38, params["text_threshold"] + 0.08),
+                    low_text=max(0.08, params["low_text"]),
+                    link_threshold=max(0.08, params["link_threshold"]),
+                )
+                if box is not None:
+                    found.append(box)
+                    matched = True
+                    break
+            if matched:
+                break
     return _make_detection(found, w, h, instances=found, mode="rect")
+
+
+def recommend_watermark_parameters(
+    frame: np.ndarray,
+    det: Detection | None,
+) -> tuple[dict[str, Any], str]:
+    default = {
+        "pad": 18,
+        "radius": 5,
+        "crf": 18,
+        "mask_mode": "char",
+        "preset_hint": "标准（推荐）",
+    }
+    if det is None:
+        return default, "未识别到明确水印，以下为保守默认建议。"
+
+    h, w = frame.shape[:2]
+    mx0, my0, mx1, my1 = det.merged
+    area_ratio = max(1, (mx1 - mx0) * (my1 - my0)) / max(1, w * h)
+    instance_count = len(det.instances or [])
+
+    if det.mode == "rect" or area_ratio >= 0.045:
+        if area_ratio >= 0.08:
+            return (
+                {
+                    "pad": 22,
+                    "radius": 6,
+                    "crf": 17,
+                    "mask_mode": "rect",
+                    "preset_hint": "自定义",
+                },
+                "检测区域较大或较成块，建议使用更大的修复范围与矩形掩膜。",
+            )
+        return (
+            {
+                "pad": 20,
+                "radius": 5,
+                "crf": 17,
+                "mask_mode": "rect",
+                "preset_hint": "更干净",
+            },
+            "检测结果更接近成块水印，建议优先保证清理完整度。",
+        )
+
+    if det.mode == "char" and instance_count >= 6 and area_ratio <= 0.03:
+        return (
+            {
+                "pad": 18,
+                "radius": 4,
+                "crf": 16,
+                "mask_mode": "char",
+                "preset_hint": "更清晰",
+            },
+            "字符边界较清晰，建议使用字符级掩膜并适当保留细节。",
+        )
+
+    return (
+        {
+            "pad": 18,
+            "radius": 5,
+            "crf": 18,
+            "mask_mode": "char" if det.mode == "char" else "rect",
+            "preset_hint": "标准（推荐）",
+        },
+        "截图中的水印特征较常规，建议使用平衡参数。",
+    )
+
+
+def draw_detection_preview(
+    frame: np.ndarray,
+    det: Detection | None,
+    recognized_texts: list[str],
+) -> np.ndarray:
+    preview = frame.copy()
+    label = "未识别到明确水印"
+    if det is not None:
+        boxes = det.instances if det.mode == "char" and det.instances else det.boxes
+        for idx, (x0, y0, x1, y1) in enumerate(boxes, start=1):
+            cv2.rectangle(preview, (x0, y0), (x1, y1), (30, 111, 79), 2)
+            cv2.putText(
+                preview,
+                f"#{idx}",
+                (x0, max(18, y0 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (30, 111, 79),
+                2,
+                cv2.LINE_AA,
+            )
+        mx0, my0, mx1, my1 = det.merged
+        cv2.rectangle(preview, (mx0, my0), (mx1, my1), (169, 95, 30), 2)
+        label = f"{det.mode} / {det.corner}"
+    if recognized_texts:
+        label = f"{label} | {' / '.join(recognized_texts[:2])}"
+    cv2.putText(
+        preview,
+        label[:72],
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (28, 36, 27),
+        2,
+        cv2.LINE_AA,
+    )
+    return preview
+
+
+def analyze_screenshot(
+    frame: np.ndarray,
+    keywords: list[str],
+    *,
+    use_gpu: bool | None = None,
+    min_instance_area: int = 12,
+) -> AdviceResult:
+    patterns = [re.compile(re.escape(k)) for k in keywords]
+    reader = build_easyocr_reader(use_gpu)
+    det = detect_watermark_boxes(
+        reader,
+        frame,
+        patterns,
+        18,
+        min_instance_area=min_instance_area,
+        aggressive_corner_scan=True,
+    )
+    recognized_texts = collect_matching_texts(reader, frame, patterns, aggressive=True)
+    recommended, message = recommend_watermark_parameters(frame, det)
+    preview = draw_detection_preview(frame, det, recognized_texts)
+    boxes = []
+    if det is not None:
+        for x0, y0, x1, y1 in (det.instances if det.instances else det.boxes):
+            boxes.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1})
+    return AdviceResult(
+        detected=det is not None,
+        message=message,
+        recommended=recommended,
+        recognized_texts=recognized_texts,
+        boxes=boxes,
+        preview_image=preview,
+    )
+
+
+def unique_advice_preview_path() -> Path:
+    p = repo_root() / "output" / "_advice"
+    p.mkdir(parents=True, exist_ok=True)
+    return p / f"{uuid.uuid4().hex}.png"
 
 
 def refine_detections(
@@ -893,23 +1345,20 @@ def mode_auto(
     char_blur: int = 3,
     track_gap: int = 8,
     min_instance_area: int = 12,
+    frame_start: int | None = None,
+    frame_end: int | None = None,
 ) -> None:
     del ocr_interval
     del carry_bbox
     del roi_fallback
-    try:
-        import easyocr
-    except ImportError as e:
-        raise SystemExit("请先安装 easyocr: pip install easyocr") from e
 
     if stage_callback is not None:
         stage_callback("initializing_ocr", "初始化 OCR")
 
-    gpu = resolve_use_gpu(use_gpu)
     fps, _, _ = probe_video(input_path)
     patterns = [re.compile(re.escape(k)) for k in keywords]
 
-    reader = easyocr.Reader(["ch_sim", "en"], gpu=gpu, verbose=False)
+    reader = build_easyocr_reader(use_gpu)
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -925,7 +1374,14 @@ def mode_auto(
         ok, frame = cap.read()
         if not ok:
             break
-        det = detect_watermark_boxes(reader, frame, patterns, pad, min_instance_area=min_instance_area)
+        det = detect_watermark_boxes(
+            reader,
+            frame,
+            patterns,
+            pad,
+            min_instance_area=min_instance_area,
+            aggressive_corner_scan=False,
+        )
         detections.append(det)
         if scan_progress is not None:
             idx = len(detections)
@@ -965,7 +1421,9 @@ def mode_auto(
                 break
             det = resolved[frame_idx] if frame_idx < len(resolved) else None
             curr_input = frame.copy()
-            if det is not None:
+            in_range = frame_start is None or frame_end is None or frame_start <= frame_idx <= frame_end
+            should_repair = det is not None and in_range
+            if should_repair:
                 mask = instances_to_mask(
                     frame,
                     det,
@@ -989,12 +1447,17 @@ def mode_auto(
                 repaired_count += 1
                 if mask_mode == "char" and det.mode != "char":
                     fallback_rect_count += 1
+            elif not in_range:
+                prev_input_frame = None
+                prev_output_frame = None
+                prev_det = None
             out_png = tmpdir / f"frame_{frame_idx:06d}.png"
             if not cv2.imwrite(str(out_png), frame):
                 raise RuntimeError(f"写入中间帧失败: {out_png}")
-            prev_input_frame = curr_input
-            prev_output_frame = frame.copy()
-            prev_det = det
+            if in_range:
+                prev_input_frame = curr_input
+                prev_output_frame = frame.copy()
+                prev_det = det
             frame_idx += 1
             if progress is not None:
                 tot = total_est if total_est > 0 else max(frame_idx, 1)

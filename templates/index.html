@@ -12,74 +12,117 @@
   </header>
 
   <main class="page">
-    <section class="hero">
-      <h1>视频水印消除工具</h1>
-      <p>上传最多 3 个视频，系统按队列顺序逐个处理。</p>
-    </section>
+    <section class="workspace">
+      <div class="column column-left">
+        <section class="panel panel-compact">
+          <h2>队列状态</h2>
+          <div id="queue-summary" class="queue-summary">
+            <div><strong id="queue-running">0</strong><span>运行中</span></div>
+            <div><strong id="queue-waiting">0</strong><span>等待中</span></div>
+            <div><strong id="queue-remaining">0</strong><span>剩余容量</span></div>
+          </div>
+        </section>
 
-    <section class="panel notice-panel">
-      <h2>下载提醒</h2>
-      <p>前端历史列表仅显示最近 30 分钟内的视频结果，超时后会从网页列表隐藏；后台文件和任务数据不删除，请及时下载保存。</p>
-    </section>
+        <section class="panel panel-fill">
+          <h2>提交任务</h2>
+          <form id="job-form" class="form">
+            <label class="field">
+              <span>视频文件</span>
+              <input id="files" name="files" type="file" accept=".mp4,.mov,.mkv,.avi,.webm" multiple required>
+              <small>单次最多 3 个视频</small>
+            </label>
 
-    <section class="panel">
-      <h2>提交任务</h2>
-      <form id="job-form" class="form">
-        <label class="field">
-          <span>视频文件</span>
-          <input id="files" name="files" type="file" accept=".mp4,.mov,.mkv,.avi,.webm" multiple required>
-          <small>单次最多 3 个视频</small>
-        </label>
+            <div class="grid">
+              <label class="field">
+                <span>输出风格</span>
+                <select id="preset" name="preset"></select>
+              </label>
 
-        <div class="grid">
-          <label class="field">
-            <span>输出风格</span>
-            <select id="preset" name="preset"></select>
-          </label>
+              <label class="field checkbox">
+                <span>使用 GPU</span>
+                <input id="use-gpu" name="use_gpu" type="checkbox">
+                <small id="gpu-hint"></small>
+              </label>
+            </div>
 
-          <label class="field checkbox">
-            <span>使用 GPU</span>
-            <input id="use-gpu" name="use_gpu" type="checkbox">
-            <small id="gpu-hint"></small>
-          </label>
-        </div>
+            <details class="advanced">
+              <summary>截图分析建议</summary>
+              <div class="form nested-form">
+                <label id="advice-paste-zone" class="paste-zone" tabindex="0">
+                  <input id="advice-file" name="file" type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp">
+                  <span id="advice-file-status">选择或粘贴截图</span>
+                </label>
+                <div class="actions">
+                  <button id="advice-submit-btn" type="button">开始分析</button>
+                  <p id="advice-message" class="submit-message"></p>
+                </div>
+                <div id="advice-result" class="advice-result empty">暂无分析结果</div>
+              </div>
+            </details>
 
-        <details class="advanced">
-          <summary>高级设置</summary>
-          <label class="field">
-            <span>关键词</span>
-            <input id="keywords" name="keywords" type="text">
-          </label>
-          <label class="field">
-            <span>ffmpeg 路径</span>
-            <input id="ffmpeg-path" name="ffmpeg_path" type="text" placeholder="可留空，自动查找">
-          </label>
-        </details>
+            <details class="advanced">
+              <summary>高级设置</summary>
+              <div class="grid advanced-grid">
+                <label class="field">
+                  <span>pad</span>
+                  <input id="custom-pad" name="custom_pad" type="number" inputmode="numeric" step="1" min="0">
+                  <small>仅在“自定义”输出风格下生效</small>
+                </label>
+                <label class="field">
+                  <span>radius</span>
+                  <input id="custom-radius" name="custom_radius" type="number" inputmode="numeric" step="1" min="1">
+                  <small>仅在“自定义”输出风格下生效</small>
+                </label>
+                <label class="field">
+                  <span>crf</span>
+                  <input id="custom-crf" name="custom_crf" type="number" inputmode="numeric" step="1" min="0" max="51">
+                  <small>仅在“自定义”输出风格下生效</small>
+                </label>
+                <label class="field">
+                  <span>掩膜模式</span>
+                  <select id="mask-mode" name="mask_mode"></select>
+                  <small>默认跟随当前输出风格，可手动改成字符级或矩形掩膜</small>
+                </label>
+                <label class="field">
+                  <span>起始帧 a</span>
+                  <input id="frame-start" name="frame_start" type="number" inputmode="numeric" step="1" min="0" placeholder="留空表示全视频">
+                  <small>从第 0 帧开始计数</small>
+                </label>
+                <label class="field">
+                  <span>结束帧 b</span>
+                  <input id="frame-end" name="frame_end" type="number" inputmode="numeric" step="1" min="0" placeholder="留空表示全视频">
+                  <small>只有 a 和 b 都填写时才启用范围处理</small>
+                </label>
+              </div>
+              <label class="field">
+                <span>关键词</span>
+                <input id="keywords" name="keywords" type="text">
+              </label>
+              <label class="field">
+                <span>ffmpeg 路径</span>
+                <input id="ffmpeg-path" name="ffmpeg_path" type="text" placeholder="可留空，自动查找">
+              </label>
+            </details>
 
-        <div class="actions">
-          <button id="submit-btn" type="submit">开始处理</button>
-          <p id="submit-message" class="submit-message"></p>
-        </div>
-      </form>
-    </section>
-
-    <section class="panel">
-      <h2>队列状态</h2>
-      <div id="queue-summary" class="queue-summary">
-        <div><strong id="queue-running">0</strong><span>运行中</span></div>
-        <div><strong id="queue-waiting">0</strong><span>等待中</span></div>
-        <div><strong id="queue-remaining">0</strong><span>剩余容量</span></div>
+            <div class="actions">
+              <button id="submit-btn" type="submit">开始处理</button>
+              <p id="submit-message" class="submit-message"></p>
+            </div>
+          </form>
+        </section>
       </div>
-    </section>
 
-    <section class="panel">
-      <h2>任务列表</h2>
-      <div id="jobs" class="jobs empty">暂无任务</div>
-    </section>
+      <div class="column column-right">
+        <section class="panel panel-fill">
+          <h2>任务列表</h2>
+          <div id="jobs" class="jobs jobs-scroll empty">暂无任务</div>
+        </section>
 
-    <section class="panel">
-      <h2>历史列表</h2>
-      <div id="history-jobs" class="jobs empty">暂无 30 分钟内的历史视频</div>
+        <section class="panel panel-fill">
+          <h2>历史列表</h2>
+          <div id="history-jobs" class="jobs jobs-scroll empty">暂无 30 分钟内的历史视频</div>
+        </section>
+      </div>
     </section>
   </main>
 
