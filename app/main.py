@@ -9,7 +9,7 @@ from fastapi.templating import Jinja2Templates
 
 from app.job_manager import manager, sse_message
 
-STATIC_VERSION = "20260407b"
+STATIC_VERSION = "20260414b"
 
 app = FastAPI(title="Doubao Watermark Remover")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -73,11 +73,16 @@ async def create_jobs(
     use_gpu: str = Form("false"),
     keywords: str = Form("豆包,AI生成"),
     ffmpeg_path: str = Form(""),
+    custom_pad: int | None = Form(None),
+    custom_radius: int | None = Form(None),
+    custom_crf: int | None = Form(None),
     mask_mode: str = Form("char"),
     char_dilate: int = Form(1),
     char_blur: int = Form(3),
     track_gap: int = Form(8),
     min_instance_area: int = Form(12),
+    frame_start: int | None = Form(None),
+    frame_end: int | None = Form(None),
 ) -> dict:
     try:
         jobs = manager.create_jobs(
@@ -87,11 +92,16 @@ async def create_jobs(
             keywords_raw=keywords,
             ffmpeg_path=ffmpeg_path,
             owner="public",
+            custom_pad=custom_pad,
+            custom_radius=custom_radius,
+            custom_crf=custom_crf,
             mask_mode=mask_mode,
             char_dilate=char_dilate,
             char_blur=char_blur,
             track_gap=track_gap,
             min_instance_area=min_instance_area,
+            frame_start=frame_start,
+            frame_end=frame_end,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

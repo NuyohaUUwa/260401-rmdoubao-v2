@@ -46,6 +46,38 @@
 
         <details class="advanced">
           <summary>高级设置</summary>
+          <div class="grid advanced-grid">
+            <label class="field">
+              <span>pad</span>
+              <input id="custom-pad" name="custom_pad" type="number" inputmode="numeric" step="1" min="0">
+              <small>仅在“自定义”输出风格下生效</small>
+            </label>
+            <label class="field">
+              <span>radius</span>
+              <input id="custom-radius" name="custom_radius" type="number" inputmode="numeric" step="1" min="1">
+              <small>仅在“自定义”输出风格下生效</small>
+            </label>
+            <label class="field">
+              <span>crf</span>
+              <input id="custom-crf" name="custom_crf" type="number" inputmode="numeric" step="1" min="0" max="51">
+              <small>仅在“自定义”输出风格下生效</small>
+            </label>
+            <label class="field">
+              <span>掩膜模式</span>
+              <select id="mask-mode" name="mask_mode"></select>
+              <small>默认跟随当前输出风格，可手动改成字符级或矩形掩膜</small>
+            </label>
+            <label class="field">
+              <span>起始帧 a</span>
+              <input id="frame-start" name="frame_start" type="number" inputmode="numeric" step="1" min="0" placeholder="留空表示全视频">
+              <small>从第 0 帧开始计数</small>
+            </label>
+            <label class="field">
+              <span>结束帧 b</span>
+              <input id="frame-end" name="frame_end" type="number" inputmode="numeric" step="1" min="0" placeholder="留空表示全视频">
+              <small>只有 a 和 b 都填写时才启用范围处理</small>
+            </label>
+          </div>
           <label class="field">
             <span>关键词</span>
             <input id="keywords" name="keywords" type="text">

@@ -21,6 +21,8 @@ PRESETS: dict[str, dict[str, int]] = {
     "更清晰": {"pad": 18, "radius": 4, "crf": 16},
     "更快速": {"pad": 18, "radius": 5, "crf": 21},
 }
+CUSTOM_PRESET = "自定义"
+CUSTOM_DEFAULTS = {"pad": 18, "radius": 5, "crf": 18}
 
 MAX_BATCH_UPLOADS = 3
 MAX_QUEUE_SIZE = 5
@@ -58,6 +60,9 @@ class JobRecord:
     input_path: str
     output_path: str
     preset: str
+    pad: int
+    radius: int
+    crf: int
     keywords: list[str]
     use_gpu: bool
     ffmpeg_path: str | None
@@ -67,6 +72,8 @@ class JobRecord:
     char_blur: int = 3
     track_gap: int = 8
     min_instance_area: int = 12
+    frame_start: int | None = None
+    frame_end: int | None = None
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     finished_at: str | None = None
     status: str = "queued"
@@ -97,6 +104,8 @@ class JobManager:
         return {
             "presets": PRESETS,
             "default_preset": "标准（推荐）",
+            "custom_preset": CUSTOM_PRESET,
+            "custom_defaults": CUSTOM_DEFAULTS,
             "default_keywords": DEFAULT_KEYWORDS,
             "gpu_available": infer_torch_cuda(),
             "max_batch_uploads": MAX_BATCH_UPLOADS,
@@ -104,6 +113,7 @@ class JobManager:
             "stage_labels": STAGE_LABELS,
             "mask_modes": ["char", "rect"],
             "default_mask_mode": "char",
+            "default_custom_mask_mode": "char",
         }
 
     def create_jobs(
@@ -114,23 +124,53 @@ class JobManager:
         keywords_raw: str,
         ffmpeg_path: str | None,
         owner: str,
+        custom_pad: int | None = None,
+        custom_radius: int | None = None,
+        custom_crf: int | None = None,
         mask_mode: str = "char",
         char_dilate: int = 1,
         char_blur: int = 3,
         track_gap: int = 8,
         min_instance_area: int = 12,
+        frame_start: int | None = None,
+        frame_end: int | None = None,
     ) -> list[dict[str, Any]]:
         if not files:
             raise ValueError("请至少上传 1 个视频文件。")
         if len(files) > MAX_BATCH_UPLOADS:
             raise ValueError(f"单次最多上传 {MAX_BATCH_UPLOADS} 个视频。")
-        if preset not in PRESETS:
+        if preset not in PRESETS and preset != CUSTOM_PRESET:
             raise ValueError("无效的预设。")
         if mask_mode not in {"char", "rect"}:
             raise ValueError("无效的掩膜模式，仅支持 char 或 rect。")
+        if preset == CUSTOM_PRESET:
+            if custom_pad is None or custom_radius is None or custom_crf is None:
+                raise ValueError("自定义预设需要填写 pad、radius、crf。")
+            pad = int(custom_pad)
+            radius = int(custom_radius)
+            crf = int(custom_crf)
+            if not 0 <= pad <= 64:
+                raise ValueError("pad 必须在 0 到 64 之间。")
+            if not 1 <= radius <= 32:
+                raise ValueError("radius 必须在 1 到 32 之间。")
+            if not 0 <= crf <= 51:
+                raise ValueError("crf 必须在 0 到 51 之间。")
+        else:
+            selected = PRESETS[preset]
+            pad = selected["pad"]
+            radius = selected["radius"]
+            crf = selected["crf"]
+        if frame_start is None or frame_end is None:
+            frame_start = None
+            frame_end = None
+        else:
+            frame_start = int(frame_start)
+            frame_end = int(frame_end)
+            if frame_start < 0 or frame_end < 0:
+                raise ValueError("帧范围必须是大于等于 0 的整数。")
+            if frame_start > frame_end:
+                raise ValueError("起始帧不能大于结束帧。")
         if preset == "更快速":
-            # “更快速”固定走修改前的矩形方案。
-            mask_mode = "rect"
             char_dilate = 0
             char_blur = 1
             track_gap = 4
@@ -172,6 +212,9 @@ class JobManager:
                     input_path=str(input_path),
                     output_path=str(output_path),
                     preset=preset,
+                    pad=pad,
+                    radius=radius,
+                    crf=crf,
                     keywords=keywords,
                     use_gpu=use_gpu,
                     ffmpeg_path=ffmpeg_path.strip() if ffmpeg_path and ffmpeg_path.strip() else None,
@@ -181,6 +224,8 @@ class JobManager:
                     char_blur=char_blur,
                     track_gap=track_gap,
                     min_instance_area=min_instance_area,
+                    frame_start=frame_start,
+                    frame_end=frame_end,
                 )
                 self._jobs[job_id] = job
                 self._job_subscribers[job_id] = []
@@ -283,8 +328,6 @@ class JobManager:
             ffmpeg = resolve_ffmpeg(job.ffmpeg_path)
             self._set_job_stage(job_id, "initializing_ocr", "初始化 OCR", status="running", event="job.started")
 
-            preset = PRESETS[job.preset]
-
             def on_stage(stage: str, message: str) -> None:
                 self._set_job_stage(job_id, stage, message, status="running", event="job.stage_changed")
 
@@ -315,9 +358,9 @@ class JobManager:
                 output_path=Path(job.output_path),
                 ffmpeg=ffmpeg,
                 keywords=job.keywords,
-                pad=preset["pad"],
-                inpaint_radius=preset["radius"],
-                crf=preset["crf"],
+                pad=job.pad,
+                inpaint_radius=job.radius,
+                crf=job.crf,
                 ocr_interval=1,
                 carry_bbox=True,
                 progress=on_progress,
@@ -330,6 +373,8 @@ class JobManager:
                 char_blur=job.char_blur,
                 track_gap=job.track_gap,
                 min_instance_area=job.min_instance_area,
+                frame_start=job.frame_start,
+                frame_end=job.frame_end,
             )
             self._set_job_stage(job_id, "completed", "完成", status="succeeded", event="job.succeeded")
         except Exception as exc:

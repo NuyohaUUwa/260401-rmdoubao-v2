@@ -893,6 +893,8 @@ def mode_auto(
     char_blur: int = 3,
     track_gap: int = 8,
     min_instance_area: int = 12,
+    frame_start: int | None = None,
+    frame_end: int | None = None,
 ) -> None:
     del ocr_interval
     del carry_bbox
@@ -965,7 +967,9 @@ def mode_auto(
                 break
             det = resolved[frame_idx] if frame_idx < len(resolved) else None
             curr_input = frame.copy()
-            if det is not None:
+            in_range = frame_start is None or frame_end is None or frame_start <= frame_idx <= frame_end
+            should_repair = det is not None and in_range
+            if should_repair:
                 mask = instances_to_mask(
                     frame,
                     det,
@@ -989,12 +993,17 @@ def mode_auto(
                 repaired_count += 1
                 if mask_mode == "char" and det.mode != "char":
                     fallback_rect_count += 1
+            elif not in_range:
+                prev_input_frame = None
+                prev_output_frame = None
+                prev_det = None
             out_png = tmpdir / f"frame_{frame_idx:06d}.png"
             if not cv2.imwrite(str(out_png), frame):
                 raise RuntimeError(f"写入中间帧失败: {out_png}")
-            prev_input_frame = curr_input
-            prev_output_frame = frame.copy()
-            prev_det = det
+            if in_range:
+                prev_input_frame = curr_input
+                prev_output_frame = frame.copy()
+                prev_det = det
             frame_idx += 1
             if progress is not None:
                 tot = total_est if total_est > 0 else max(frame_idx, 1)

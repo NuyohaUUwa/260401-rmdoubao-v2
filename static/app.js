@@ -7,6 +7,7 @@ const state = {
 };
 
 const HISTORY_WINDOW_MS = 30 * 60 * 1000;
+const CUSTOM_PRESET = "自定义";
 
 function qs(id) {
   return document.getElementById(id);
@@ -178,6 +179,85 @@ function subscribeJob(jobId) {
   state.jobStreams.set(jobId, stream);
 }
 
+const PRESET_LABELS = {
+  "标准（推荐）": "标准（推荐） - 均衡",
+  "更干净": "更干净 - 清理更彻底",
+  "更清晰": "更清晰 - 更保细节",
+  "更快速": "更快速 - 提速优先",
+  [CUSTOM_PRESET]: "自定义 - 手动设置参数",
+};
+
+function maskModeForPreset(preset) {
+  return preset === "更快速" ? "rect" : state.meta.default_custom_mask_mode;
+}
+
+function setCustomFieldsEnabled(enabled) {
+  ["custom-pad", "custom-radius", "custom-crf"].forEach((id) => {
+    qs(id).disabled = !enabled;
+  });
+}
+
+function applyPresetDefaults(preset) {
+  const defaults = preset === CUSTOM_PRESET ? state.meta.custom_defaults : state.meta.presets[preset];
+  qs("custom-pad").value = defaults.pad;
+  qs("custom-radius").value = defaults.radius;
+  qs("custom-crf").value = defaults.crf;
+  qs("mask-mode").value = maskModeForPreset(preset);
+  setCustomFieldsEnabled(preset === CUSTOM_PRESET);
+}
+
+function parseNonNegativeInteger(value, label) {
+  if (value === "") {
+    return null;
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${label}必须是大于等于 0 的整数。`);
+  }
+  return Number.parseInt(value, 10);
+}
+
+function parseBoundedInteger(value, label, min, max) {
+  if (!/^-?\d+$/.test(value)) {
+    throw new Error(`${label}必须是整数。`);
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (parsed < min || parsed > max) {
+    throw new Error(`${label}必须在 ${min} 到 ${max} 之间。`);
+  }
+  return parsed;
+}
+
+function validateAdvancedOptions() {
+  const preset = qs("preset").value;
+  const result = {
+    preset,
+    maskMode: qs("mask-mode").value,
+    customPad: null,
+    customRadius: null,
+    customCrf: null,
+    frameStart: null,
+    frameEnd: null,
+  };
+  if (preset === CUSTOM_PRESET) {
+    result.customPad = parseBoundedInteger(qs("custom-pad").value.trim(), "pad", 0, 64);
+    result.customRadius = parseBoundedInteger(qs("custom-radius").value.trim(), "radius", 1, 32);
+    result.customCrf = parseBoundedInteger(qs("custom-crf").value.trim(), "crf", 0, 51);
+  }
+  const frameStartRaw = qs("frame-start").value.trim();
+  const frameEndRaw = qs("frame-end").value.trim();
+  const frameStart = parseNonNegativeInteger(frameStartRaw, "起始帧");
+  const frameEnd = parseNonNegativeInteger(frameEndRaw, "结束帧");
+  if ((frameStart === null) !== (frameEnd === null)) {
+    throw new Error("起始帧和结束帧需要同时填写，留空则表示全视频。");
+  }
+  if (frameStart !== null && frameEnd !== null && frameStart > frameEnd) {
+    throw new Error("起始帧不能大于结束帧。");
+  }
+  result.frameStart = frameStart;
+  result.frameEnd = frameEnd;
+  return result;
+}
+
 async function loadInitialState() {
   const [metaResp, jobsResp] = await Promise.all([
     fetch("/api/meta"),
@@ -190,16 +270,32 @@ async function loadInitialState() {
   Object.keys(state.meta.presets).forEach((name) => {
     const option = document.createElement("option");
     option.value = name;
-    option.textContent = name;
+    option.textContent = PRESET_LABELS[name] || name;
     if (name === state.meta.default_preset) {
       option.selected = true;
     }
     presetSelect.appendChild(option);
   });
+  const customOption = document.createElement("option");
+  customOption.value = state.meta.custom_preset;
+  customOption.textContent = PRESET_LABELS[state.meta.custom_preset] || state.meta.custom_preset;
+  presetSelect.appendChild(customOption);
+
+  const maskModeSelect = qs("mask-mode");
+  state.meta.mask_modes.forEach((name) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    if (name === state.meta.default_mask_mode) {
+      option.selected = true;
+    }
+    maskModeSelect.appendChild(option);
+  });
 
   qs("keywords").value = state.meta.default_keywords;
   qs("use-gpu").checked = state.meta.gpu_available;
   qs("gpu-hint").textContent = state.meta.gpu_available ? "已检测到 CUDA" : "未检测到 CUDA，将使用 CPU";
+  applyPresetDefaults(state.meta.default_preset);
 
   updateQueueSummary(jobsData.queue);
   for (const job of jobsData.jobs) {
@@ -234,14 +330,29 @@ async function submitJobs(event) {
     return;
   }
 
+  let options;
+  try {
+    options = validateAdvancedOptions();
+  } catch (error) {
+    setSubmitMessage(error.message || "高级设置参数无效。", true);
+    return;
+  }
+
   const formData = new FormData();
   files.forEach((file) => formData.append("files", file));
-  formData.append("preset", qs("preset").value);
+  formData.append("preset", options.preset);
   formData.append("use_gpu", qs("use-gpu").checked ? "true" : "false");
   formData.append("keywords", qs("keywords").value);
   formData.append("ffmpeg_path", qs("ffmpeg-path").value);
-  if (qs("preset").value === "更快速") {
-    formData.append("mask_mode", "rect");
+  formData.append("mask_mode", options.maskMode);
+  if (options.preset === CUSTOM_PRESET) {
+    formData.append("custom_pad", String(options.customPad));
+    formData.append("custom_radius", String(options.customRadius));
+    formData.append("custom_crf", String(options.customCrf));
+  }
+  if (options.frameStart !== null && options.frameEnd !== null) {
+    formData.append("frame_start", String(options.frameStart));
+    formData.append("frame_end", String(options.frameEnd));
   }
 
   const submitBtn = qs("submit-btn");
@@ -272,6 +383,9 @@ async function submitJobs(event) {
 
 document.addEventListener("DOMContentLoaded", async () => {
   qs("job-form").addEventListener("submit", submitJobs);
+  qs("preset").addEventListener("change", (event) => {
+    applyPresetDefaults(event.target.value);
+  });
   try {
     subscribeQueue();
     await loadInitialState();

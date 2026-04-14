@@ -94,6 +94,7 @@ body {
 }
 
 .field input[type="text"],
+.field input[type="number"],
 .field input[type="file"],
 .field select {
   width: 100%;
@@ -120,6 +121,16 @@ body {
   cursor: pointer;
   margin-bottom: 12px;
   color: var(--accent-strong);
+}
+
+.advanced-grid {
+  margin-bottom: 14px;
+}
+
+.field input:disabled {
+  background: #f1efe8;
+  color: #7d8378;
+  cursor: not-allowed;
 }
 
 .actions {
